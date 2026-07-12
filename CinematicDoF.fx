@@ -35,9 +35,23 @@ uniform float FocusRange <
 > = 0.15;
 
 uniform bool ShowFocusPoint <
-    ui_label = "Show Autofocus Zone";
-    ui_tooltip = "Displays a rectangle representing the autofocus zone.";
+    ui_label = "Show DSLR AF Points";
+    ui_tooltip = "Displays the DSLR autofocus points. Active points are green, inactive points are red/grey.";
 > = false;
+
+uniform int FocusPointSelect <
+    ui_type = "combo";
+    ui_label = "AF Point Selection";
+    ui_items = "Auto (5-Point)\0Center\0Left\0Right\0Top\0Bottom\0";
+    ui_tooltip = "Selects which DSLR focus point to use. Auto will choose the closest target among all 5 points.";
+> = 0;
+
+uniform float FocusPointOffset <
+    ui_type = "slider";
+    ui_min = 0.05; ui_max = 0.4; ui_step = 0.01;
+    ui_label = "AF Point Offset";
+    ui_tooltip = "Distance of the Left, Right, Top, and Bottom points from the center.";
+> = 0.15;
 
 uniform bool FullAuto <
     ui_label = "Full Auto Mode (Dynamic DoF)";
@@ -68,7 +82,7 @@ uniform float HighlightThreshold <
 uniform float frame_time < source = "frametime"; >;
 
 // Textures & Samplers
-texture2D texFocus { Width = 1; Height = 1; Format = R32F; };
+texture2D texFocus { Width = 1; Height = 1; Format = RG32F; };
 sampler2D samFocus { Texture = texFocus; };
 
 // Helper Functions
@@ -77,26 +91,22 @@ float GetNoise(float2 co)
     return frac(sin(dot(co, float2(12.9898, 78.233))) * 43758.5453);
 }
 
-// Compute Focus distance based on the dominant depth (largest object) inside the autofocus zone
-void PS_Focus(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float focus : SV_Target)
+float GetPointFocusDepth(float2 centerCoord)
 {
-    float currentFocus = tex2D(samFocus, float2(0.5, 0.5)).r;
-    if (currentFocus <= 0.0) currentFocus = 1.0;
-
-    // Sample a 5x5 grid in the center zone
-    float depths[25];
+    float depths[9];
     int idx = 0;
     
     [unroll]
-    for (int x = -2; x <= 2; x++)
+    for (int x = -1; x <= 1; x++)
     {
         [unroll]
-        for (int y = -2; y <= 2; y++)
+        for (int y = -1; y <= 1; y++)
         {
-            float2 offset = float2(x, y) / 2.0 * FocusRange;
+            float2 offset = float2(x, y) * (FocusRange * 0.5);
             // Correct for aspect ratio
             offset.y *= BUFFER_ASPECT_RATIO;
-            float2 sampleCoord = float2(0.5, 0.5) + offset;
+            float2 sampleCoord = centerCoord + offset;
+            sampleCoord = clamp(sampleCoord, 0.0, 1.0);
             
             depths[idx] = ReShade::GetLinearizedDepth(sampleCoord);
             idx++;
@@ -104,17 +114,17 @@ void PS_Focus(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float f
     }
 
     // Find the depth that has the most similar neighbors (representing the largest object surface)
-    float targetFocus = depths[12]; // Default to center sample
+    float targetFocus = depths[4]; // Default to center sample of this point
     int maxCount = 0;
 
-    for (int i = 0; i < 25; i++)
+    for (int i = 0; i < 9; i++)
     {
         int count = 0;
         float d1 = depths[i];
         // Adaptive threshold that scales with depth
         float threshold = 0.01 + d1 * 0.04;
         
-        for (int j = 0; j < 25; j++)
+        for (int j = 0; j < 9; j++)
         {
             if (abs(d1 - depths[j]) < threshold)
             {
@@ -129,17 +139,75 @@ void PS_Focus(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float f
             targetFocus = d1;
         }
     }
+    return targetFocus;
+}
+
+// Compute Focus distance based on the dominant depth (largest object) inside the autofocus zone
+void PS_Focus(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float2 focus : SV_Target)
+{
+    float2 currentFocusData = tex2D(samFocus, float2(0.5, 0.5)).rg;
+    float currentFocus = currentFocusData.r;
+    if (currentFocus <= 0.0) currentFocus = 1.0;
+
+    // Define 5 DSLR AF point centers
+    float2 points[5];
+    points[0] = float2(0.5, 0.5); // Center
+    points[1] = float2(0.5 - FocusPointOffset, 0.5); // Left
+    points[2] = float2(0.5 + FocusPointOffset, 0.5); // Right
+    points[3] = float2(0.5, 0.5 - FocusPointOffset * BUFFER_ASPECT_RATIO); // Top
+    points[4] = float2(0.5, 0.5 + FocusPointOffset * BUFFER_ASPECT_RATIO); // Bottom
+
+    float targetFocus = 1.0;
+    int activeIdx = 0;
+
+    if (FocusPointSelect == 0) // Auto 5-Point
+    {
+        float minDepth = 1.0;
+        int bestIdx = 0;
+        
+        [unroll]
+        for (int i = 0; i < 5; i++)
+        {
+            float d = GetPointFocusDepth(points[i]);
+            // Focus on the closest object (closest has the lowest depth value)
+            if (d < minDepth && d > 0.0)
+            {
+                minDepth = d;
+                bestIdx = i;
+            }
+        }
+        
+        // If all points are at far plane/sky, default to center point depth
+        if (minDepth >= 1.0)
+        {
+            targetFocus = GetPointFocusDepth(points[0]);
+            activeIdx = 0;
+        }
+        else
+        {
+            targetFocus = minDepth;
+            activeIdx = bestIdx;
+        }
+    }
+    else // Manual selection
+    {
+        activeIdx = FocusPointSelect - 1;
+        targetFocus = GetPointFocusDepth(points[activeIdx]);
+    }
 
     // Smoothly interpolate focus
     float factor = saturate(FocusSpeed * (frame_time * 0.001));
-    focus = lerp(currentFocus, targetFocus, factor);
+    float finalFocus = lerp(currentFocus, targetFocus, factor);
+    focus = float2(finalFocus, (float)activeIdx);
 }
 
 // Main DoF Blur Pass
 void PS_DoF(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 color : SV_Target)
 {
     float centerDepth = ReShade::GetLinearizedDepth(texcoord);
-    float focusDist = tex2D(samFocus, float2(0.5, 0.5)).r;
+    float2 focusData = tex2D(samFocus, float2(0.5, 0.5)).rg;
+    float focusDist = focusData.x;
+    int activeIdx = (int)(focusData.y + 0.5);
     
     float currentAperture = Aperture;
     if (FullAuto)
@@ -157,14 +225,35 @@ void PS_DoF(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 co
     {
         color = tex2D(ReShade::BackBuffer, texcoord);
         
-        // Show autofocus zone if enabled
+        // Show DSLR AF points if enabled
         if (ShowFocusPoint)
         {
-            float2 dist = abs(texcoord - float2(0.5, 0.5));
-            dist.y /= BUFFER_ASPECT_RATIO;
-            if (max(dist.x, dist.y) < FocusRange && min(abs(dist.x - FocusRange), abs(dist.y - FocusRange)) < 0.002)
+            float2 points[5];
+            points[0] = float2(0.5, 0.5); // Center
+            points[1] = float2(0.5 - FocusPointOffset, 0.5); // Left
+            points[2] = float2(0.5 + FocusPointOffset, 0.5); // Right
+            points[3] = float2(0.5, 0.5 - FocusPointOffset * BUFFER_ASPECT_RATIO); // Top
+            points[4] = float2(0.5, 0.5 + FocusPointOffset * BUFFER_ASPECT_RATIO); // Bottom
+
+            float boxSize = 0.012;
+            float borderThickness = 0.0015;
+
+            [unroll]
+            for (int i = 0; i < 5; i++)
             {
-                color.rgb = float3(1.0, 0.0, 0.0);
+                float2 dist = abs(texcoord - points[i]);
+                dist.y /= BUFFER_ASPECT_RATIO;
+                
+                // Draw a hollow square
+                if (max(dist.x, dist.y) < boxSize && min(abs(dist.x - boxSize), abs(dist.y - boxSize)) < borderThickness)
+                {
+                    color.rgb = (i == activeIdx) ? float3(0.0, 1.0, 0.2) : float3(0.4, 0.4, 0.4);
+                }
+                // Center dot
+                else if (max(dist.x, dist.y) < 0.002)
+                {
+                    color.rgb = (i == activeIdx) ? float3(0.0, 1.0, 0.2) : float3(0.4, 0.4, 0.4);
+                }
             }
         }
         return;
@@ -243,14 +332,35 @@ void PS_DoF(float4 vpos : SV_POSITION, float2 texcoord : TEXCOORD, out float4 co
         color = tex2D(ReShade::BackBuffer, texcoord);
     }
     
-    // Show autofocus zone if enabled
+    // Show DSLR AF points if enabled
     if (ShowFocusPoint)
     {
-        float2 dist = abs(texcoord - float2(0.5, 0.5));
-        dist.y /= BUFFER_ASPECT_RATIO;
-        if (max(dist.x, dist.y) < FocusRange && min(abs(dist.x - FocusRange), abs(dist.y - FocusRange)) < 0.002)
+        float2 points[5];
+        points[0] = float2(0.5, 0.5); // Center
+        points[1] = float2(0.5 - FocusPointOffset, 0.5); // Left
+        points[2] = float2(0.5 + FocusPointOffset, 0.5); // Right
+        points[3] = float2(0.5, 0.5 - FocusPointOffset * BUFFER_ASPECT_RATIO); // Top
+        points[4] = float2(0.5, 0.5 + FocusPointOffset * BUFFER_ASPECT_RATIO); // Bottom
+
+        float boxSize = 0.012;
+        float borderThickness = 0.0015;
+
+        [unroll]
+        for (int i = 0; i < 5; i++)
         {
-            color.rgb = float3(1.0, 0.0, 0.0);
+            float2 dist = abs(texcoord - points[i]);
+            dist.y /= BUFFER_ASPECT_RATIO;
+            
+            // Draw a hollow square
+            if (max(dist.x, dist.y) < boxSize && min(abs(dist.x - boxSize), abs(dist.y - boxSize)) < borderThickness)
+            {
+                color.rgb = (i == activeIdx) ? float3(0.0, 1.0, 0.2) : float3(0.4, 0.4, 0.4);
+            }
+            // Center dot
+            else if (max(dist.x, dist.y) < 0.002)
+            {
+                color.rgb = (i == activeIdx) ? float3(0.0, 1.0, 0.2) : float3(0.4, 0.4, 0.4);
+            }
         }
     }
 }
